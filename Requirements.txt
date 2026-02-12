@@ -1,1 +1,5 @@
-streamlit groq streamlit-mic-recorder textstat
+streamlit
+groq
+streamlit-mic-recorder
+textstat
+python-dotenv
