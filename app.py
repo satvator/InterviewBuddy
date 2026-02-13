@@ -2,6 +2,7 @@ import streamlit as st
 from groq import Groq
 import re
 import io
+import math
 from streamlit_mic_recorder import mic_recorder
 import os
 from dotenv import load_dotenv
@@ -10,82 +11,99 @@ load_dotenv()
 # --- 1. CONFIG & CLIENT ---
 st.set_page_config(page_title="Interview Buddy", page_icon="🎤")
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-MODEL = "llama-3.3-70b-versatile"
+MODEL_LLM = "llama-3.3-70b-versatile"
+MODEL_STT = "whisper-large-v3"
 
-# --- 2. CORE FUNCTIONS ---
-def transcribe_audio(audio_bytes):
+# --- ADVANCED ANALYSIS FUNCTIONS ---
+def process_audio(audio_bytes):
+    """
+    Transcribes audio AND extracts 'hidden' metadata like 
+    confidence scores and duration for analysis.
+    """
     audio_file = io.BytesIO(audio_bytes)
-    audio_file.name = "input.wav"
-    return client.audio.transcriptions.create(
-        file=audio_file,
-        model="whisper-large-v3",
-        response_format="text"
-    )
-
-def count_fillers(text):
-    fillers = ["um", "uh", "like", "actually", "basically", "you know"]
-    counts = {w: len(re.findall(rf"\b{w}\b", text.lower())) for w in fillers}
-    return sum(counts.values())
-
-# --- 3. UI LAYOUT ---
-st.title("🎤 Interview Buddy")
-role = st.selectbox("Choose your target role:", ["Data Science", "Marketing", "Software Engineering"])
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "current_q" not in st.session_state:
-    st.session_state.current_q = None
-
-# --- 4. THE INTERVIEW CYCLE ---
-if not st.session_state.current_q:
-    if st.button("🚀 Start Interview"):
-        resp = client.chat.completions.create(
-            messages=[{"role": "user", "content": f"Ask a first interview question for {role}."}],
-            model=MODEL
-        )
-        st.session_state.current_q = resp.choices[0].message.content
-        st.rerun()
-
-if st.session_state.current_q:
-    st.chat_message("assistant").write(st.session_state.current_q)
+    audio_file.name = "audio.wav"
     
-    # Recording Section
-    audio = mic_recorder(start_prompt="⏺️ Record Answer", stop_prompt="⏹️ Stop Recording", key='recorder')
+    # 1. Get Verbose JSON for deep analytics
+    response = client.audio.transcriptions.create(
+        file=audio_file,
+        model=MODEL_STT,
+        response_format="verbose_json"  # <--- KEY CHANGE
+    )
+    
+    text = response.text
+    duration = response.duration
+    
+    # 2. Calculate Confidence (Logprob -> 0-100% Score)
+    # Whisper returns negative log probability. 0 is perfect, -1 is okay, -5 is bad.
+    avg_logprob = response.segments[0]['avg_logprob'] if response.segments else -1.0
+    confidence_score = math.exp(avg_logprob) * 100 
+    
+    # 3. Calculate Pace (Words Per Minute)
+    word_count = len(text.split())
+    wpm = (word_count / duration) * 60 if duration > 0 else 0
+    
+    return text, duration, confidence_score, wpm
 
+def get_grammar_check(text):
+    """Asks LLM to fix grammar and suggest better phrasing."""
+    prompt = f"""
+    Act as a strict English coach. Analyze this candidate's interview answer:
+    "{text}"
+    
+    Provide output in this exact format:
+    1. CORRECTION: [Rewrite the sentence with perfect grammar]
+    2. TIP: [One specific tip to sound more professional]
+    """
+    resp = client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model=MODEL_LLM
+    )
+    return resp.choices[0].message.content
+
+# --- UI LAYOUT ---
+st.title("👨‍💼 Interview Pro: AI Coach")
+st.caption("Analyzes: Content + Clarity + Pace + Grammar")
+
+# Initialize State
+if "history" not in st.session_state: st.session_state.history = []
+if "q" not in st.session_state: st.session_state.q = "Tell me about yourself and why you want this role."
+
+# --- MAIN INTERFACE ---
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    st.info(f"🗣️ **Current Question:**\n\n{st.session_state.q}")
+    audio = mic_recorder(start_prompt="⏺️ Record Answer", stop_prompt="⏹️ Stop & Analyze", key='recorder')
+
+with col2:
     if audio:
-        with st.spinner("AI is listening..."):
-            transcript = transcribe_audio(audio['bytes'])
-            fillers = count_fillers(transcript)
+        with st.spinner("🎧 Listening & Analyzing metrics..."):
+            # Run the complex processing
+            text, duration, confidence, wpm = process_audio(audio['bytes'])
+            grammar_feedback = get_grammar_check(text)
             
-            # --- 5. THE FEEDBACK HUB (With the requested Popover/Dialogue) ---
+            # --- DASHBOARD METRICS ---
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Speaking Pace", f"{int(wpm)} WPM", help="Target: 130-150 WPM")
+            m2.metric("Clarity Score", f"{int(confidence)}%", help="Based on AI confidence. <80% means you might be mumbling.")
+            m3.metric("Duration", f"{duration:.1f}s")
+            
+            # --- PRONUNCIATION / GRAMMAR SECTION ---
             st.divider()
-            col1, col2 = st.columns([1, 1])
+            st.subheader("📝 Grammar & Phrasing Coach")
+            st.warning(f"You said: '{text}'")
+            st.markdown(grammar_feedback)
             
-            with col1:
-                st.metric("Filler Words Used", fillers, help="Lower is better! Aims for < 3 per answer.")
+            # Save context for follow-up
+            st.session_state.history.append({"q": st.session_state.q, "a": text})
             
-            with col2:
-                # This is the "Dialogue Box" popover you asked for
-                with st.popover("ℹ️ What is this?"):
-                    st.markdown("""
-                    ### How to read your stats:
-                    - **Filler Words:** Tracks words like 'um' and 'like' that distract listeners.
-                    - **Transcript:** Review your exact words to check for pronunciation or flow issues.
-                    - **Follow-up:** AI generates the next question based on your specific response.
-                    """)
-
-            with st.expander("📝 View Transcript"):
-                st.write(transcript)
-
-            # Generate next question
-            st.session_state.chat_history.append({"q": st.session_state.current_q, "a": transcript})
-            prompt = f"Previous context: {st.session_state.chat_history}. Ask a follow-up question for {role}."
+            # Generate Follow-up
+            context_prompt = f"History: {st.session_state.history[-3:]}. Ask a tough follow-up question."
+            new_q = client.chat.completions.create(
+                 messages=[{"role": "user", "content": context_prompt}],
+                 model=MODEL_LLM
+            ).choices[0].message.content
             
-            next_resp = client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model=MODEL
-            )
-            st.session_state.current_q = next_resp.choices[0].message.content
-            
-            if st.button("Continue to Next Question ➡️"):
+            if st.button("Next Question ➡️"):
+                st.session_state.q = new_q
                 st.rerun()
